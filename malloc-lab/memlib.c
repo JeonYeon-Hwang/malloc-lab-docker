@@ -55,11 +55,13 @@ void mem_reset_brk()
  *    by incr bytes and returns the start address of the new area. In
  *    this model, the heap cannot be shrunk.
  */
+// 힙의 끝 점을 뒤로 밀어버리는 함수 .. 가상 힙 메모리는 1차원 배열임
+// 이 함수는 할당된 주소를 침범하지 않고 다음 주소를 제시하는 역할을 함
 void *mem_sbrk(int incr) 
 {
-    char *old_brk = mem_brk;
+    char *old_brk = mem_brk;  // 현재 힙 끝 주소는 .. 새 공간의 시작 주소 => 전역? 상태로 추적하고 관리하는 값
 
-    if ( (incr < 0) || ((mem_brk + incr) > mem_max_addr)) {
+    if ( (incr < 0) || ((mem_brk + incr) > mem_max_addr)) {  // incr 가 음수일 경우 or 최대 메모리 주소 초과시 .. 오류!
 	errno = ENOMEM;
 	fprintf(stderr, "ERROR: mem_sbrk failed. Ran out of memory...\n");
 	return (void *)-1;
