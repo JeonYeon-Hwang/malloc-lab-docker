@@ -48,9 +48,17 @@ team_t team = {
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7)
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 #define GET_SIZE(p) (*(size_t *)(p) & ~0x7) // 해당 주소의 8바이트 값 읽어서 size 도출
+#define GET_ALLOC(p) (*(size_t *)(p) & 0x1) // 해당 주소의 1바이트 값 읽어서 할당유무 확인
 #define HDRP(bp) ((char *)bp - SIZE_T_SIZE) // payload 주소값으로 header 찾기
 #define FTRP(bp) ((char *)bp + GET_SIZE(HDRP(bp)) - (2 * SIZE_T_SIZE)) // payload 주소값으로 footer 찾기
 
+// 얘들은 일단 복붙
+#define WSIZE (SIZE_T_SIZE)
+#define DSIZE (2 * SIZE_T_SIZE)
+#define PACK(size, alloc) ((size) | (alloc))
+#define PUT(p, val) (*(size_t *)(p) = (val))
+#define NEXT_BLKP(bp) (((char *)(bp) + GET_SIZE((char *)(bp) - WSIZE)))
+#define PREV_BLKP(bp) (((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE))) 
 
 static char *heap_listp; // heap의 시작 주소 => 1바이트 단위 계산을 위해 char로 설정
 
@@ -95,14 +103,21 @@ void *mm_malloc(size_t size) // void와 void *는 다름 .. size_t => 메모리 
     if(internal_p != (void *)-1){
         size_t curr_size = GET_SIZE(HDRP(internal_p)); // 기존 빈 공간 사이즈
 
-        *(size_t *)HDRP(internal_p) = (newsize | 1); // header에 새 size 할당 & 할당상태
-        *(size_t *)FTRP(internal_p) = (newsize | 1); // footer에 새 size 할당 & 할당상태
+        if(curr_size - newsize >= 2 * DSIZE){
+            PUT(HDRP(internal_p), PACK(newsize, 1)); // header에 새 size 할당 & 할당상태
+            PUT(FTRP(internal_p), PACK(newsize, 1)); // footer에 새 size 할당 & 할당상태
+
+            void *next_bp = (char *)internal_p + newsize;  // 남은 공간 시작점 payload 주소값 찾기!!
+            int free_amount = curr_size - newsize; // 남은 공간 size 계산
+
+            PUT(HDRP(next_bp), PACK(free_amount, 0)); // 남은 공간 header에 free_amount 명시
+            PUT(FTRP(next_bp), PACK(free_amount, 0)); // 남은 공간 footer에 free_amount 명시
+        }
+        else{ // 내부 단편화 감수하고 .. 설정
+            PUT(HDRP(internal_p), PACK(curr_size, 1));
+            PUT(FTRP(internal_p), PACK(curr_size, 1)); 
+        }
         
-        void *next_bp = (char *)internal_p + newsize;  // 남은 공간 시작점 payload 주소값 찾기
-        int free_amount = curr_size - newsize; // 남은 공간 size 계산
-        
-        *(size_t *)HDRP(next_bp) = (free_amount | 0); // 남은 공간 header에 free_amount 명시
-        *(size_t *)FTRP(next_bp) = (free_amount | 0); // 남은 공간 footer에 free_amount 명시
         
         dbg_printf("===> find_fit 여유공간 있음! .. header 위치: %p (%ld bytes)\n", HDRP(internal_p), (char *)HDRP(internal_p) - (char *)heap_listp); 
         return(void *)internal_p; // 사용자가 할당할 payload 주소를 반환
@@ -120,6 +135,7 @@ void *mm_malloc(size_t size) // void와 void *는 다름 .. size_t => 메모리 
         *(size_t *)(FTRP(p) + SIZE_T_SIZE) = (0 | 1); // 확장된 heap의 새 에필로그
 
         dbg_printf("===> 공간 할당! .. header 위치: %p (%ld bytes)\n", HDRP(p), HDRP(p) - (char *)heap_listp);
+        
         return (void *)((char *)p); // 다시 (char *)로 형으로 
                                     // payload 값으로 반환                                           
     }
@@ -130,13 +146,17 @@ void *mm_malloc(size_t size) // void와 void *는 다름 .. size_t => 메모리 
  */
 // 메모리를 해제하는 로직
 // header와 footer 모두 size_t 형식의 데이터 양을 명시한다
-void mm_free(void *ptr) // ptr 주소 = payload 주소(header + 8)
+void mm_free(void *ptr) // ptr 주소 = payload 주소
 {
-    void *header = HDRP(ptr); // payload => header추출
-    size_t size = *(size_t *)header; // header => size_t(정수화)
-    *(size_t *)header = size & ~0x1; // 마지막 비드를 0으로 만들어 해제
+    if(ptr == NULL) return;
+
+    size_t size = GET_SIZE(HDRP(ptr)); // payload 기반 size 추출
+    PUT(HDRP(ptr), PACK(size, 0)); //payload 기반 헤더 할당해제
+    PUT(FTRP(ptr), PACK(size, 0)); //payload 기반 푸터 할당해제
     
-    dbg_printf("mm_free: 다음 공간이 해제되었습니다:      header|   size_t ===> %8p (%d bytes)\n", header, (int)(size));
+    dbg_printf("mm_free: 다음 공간이 해제되었습니다:      header|   size_t ===> %8p (%d bytes)\n", HDRP(ptr), (int)(size));
+    
+    coalesce(ptr); // 병합하기
 }
 
 /*
@@ -146,22 +166,20 @@ void mm_free(void *ptr) // ptr 주소 = payload 주소(header + 8)
 // 동적 메모리 할당 => 국소적 관리를 이용할 것
 void *mm_realloc(void *ptr, size_t size)
 {
-    void *oldptr = ptr;
-    void *newptr;
-    size_t copySize;
-
-    newptr = mm_malloc(size);
-    dbg_printf("mm_realloc: 공간 재할당 시도 ");
-    if (newptr == NULL){
-        dbg_printf("=> 재할당 공간이 부족합니다(실패)! \n");
+    if (ptr == NULL) return mm_malloc(size);
+    if (size == 0) {
+        mm_free(ptr);
         return NULL;
     }
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-    if (size < copySize)
-        copySize = size;
-    memcpy(newptr, oldptr, copySize);
-    dbg_printf("=> newptr <-> oldptr 간 재조정이 일어났습니다! \n");
-    mm_free(oldptr);
+
+    void *newptr = mm_malloc(size);
+    if (newptr == NULL) return NULL;
+
+    size_t copySize = GET_SIZE(HDRP(ptr)) - 2 * SIZE_T_SIZE;
+    if (size < copySize) copySize = size;
+
+    memcpy(newptr, ptr, copySize);
+    mm_free(ptr);
     return newptr;
 }
 
@@ -186,11 +204,38 @@ static void *find_fit(size_t put_size){
 
 
 
-// 병합 함수: mm_free & extend_heap 이벤트에서 호출
-static void *coalesce(void *bp){
+// 병합 함수: mm_free & extend_heap 이벤트에서 호출 => 4가지 경우의 수
+static void *coalesce(void *bp){ 
+    char *prev_bp = (char *)bp - GET_SIZE((char *)(bp) - (2 * SIZE_T_SIZE)); // 이전 블록의 payload
+    char *next_bp = (char *)bp + GET_SIZE((char *)(bp) - (SIZE_T_SIZE)); // 다음 블록의 payload
 
+    size_t prev_alloc = GET_ALLOC(FTRP(prev_bp)); // 현 payload 기준 => 푸터로 이동하여 할당유무 확인
+    size_t next_alloc = GET_ALLOC(HDRP(next_bp)); // 현 payload 기준 => 헤더로 이동하여 할당유무 확인
+    size_t size = GET_SIZE(HDRP(bp)); // 현 payload 기준 => 블록의 size 추출
+
+    if(prev_alloc && next_alloc){ // 앞 뒤 블록이 모두 할당되어 있다면?
+        return bp; // 변화 없음
+    }
+    else if(prev_alloc && !next_alloc){ // 뒤 블록만 free라면?
+        size += GET_SIZE(HDRP(next_bp)); // 뒤 블록의 size를 더함
+        *(size_t *)HDRP(bp) = (size | 0); // 현 블록 헤더 size 확장 
+        *(size_t *)FTRP(bp) = (size | 0); // 현 블록 푸터 size 확장 
+    }
+    else if(!prev_alloc && next_alloc){ // 앞 블록만 free라면?
+        size += GET_SIZE(HDRP(prev_bp)); // 앞 블록의 size를 더함
+        *(size_t *)HDRP(prev_bp) = (size | 0); // 앞 블록 헤더 size 확장
+        *(size_t *)FTRP(prev_bp) = (size | 0); // 현 블록 푸터 size 확장
+        bp = prev_bp; // bp를 앞 블록 payload로 이동
+    }
+    else if(!prev_alloc && !next_alloc){ // 앞 뒤 블록 모두 free라면?
+        size += (GET_SIZE(HDRP(next_bp)) + GET_SIZE(HDRP(prev_bp))); // 앞 뒤 블록의 size를 모두 더함
+        *(size_t *)HDRP(prev_bp) = (size | 0); // 앞 블록의 헤더 size 확장
+        *(size_t *)FTRP(prev_bp) = (size | 0); // 뒤 블록의 푸터 size 확장
+        bp = prev_bp; // bp를 앞 블록 payload로 이동
+    }
+    dbg_printf("인접 free 블록과 합병! => header(positon)(size): %p(%ld bytes)(%d bytes)\n", HDRP(bp), HDRP(bp) - (char *)heap_listp, (int)(size));
+    return bp;
 }
-
 
 
 // short1-bal.rep: Perf index = 30 (util) + 7 (thru) = 37/100 
