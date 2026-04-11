@@ -47,12 +47,15 @@ team_t team = {
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7)
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
-#define HDRP(bp) ((char *)bp - SIZE_T_SIZE) // payload 주소값으로 header 찾기
 #define GET_SIZE(p) (*(size_t *)(p) & ~0x7) // 해당 주소의 8바이트 값 읽어서 size 도출
+#define HDRP(bp) ((char *)bp - SIZE_T_SIZE) // payload 주소값으로 header 찾기
+#define FTRP(bp) ((char *)bp + GET_SIZE(HDRP(bp)) - (2 * SIZE_T_SIZE)) // payload 주소값으로 footer 찾기
+
 
 static char *heap_listp; // heap의 시작 주소 => 1바이트 단위 계산을 위해 char로 설정
 
 static void *find_fit(size_t put_size); // implicit 구현: 사이 탐색 함수
+static void *coalesce(void *bp); // 인접 free 공간 병합 함수
 
 
 
@@ -62,14 +65,15 @@ static void *find_fit(size_t put_size); // implicit 구현: 사이 탐색 함수
 // 메모리를 초기화 하는 로직: 한 테스트 시나리오 종료 시 발동
 int mm_init(void)
 {
-    char *p = mem_sbrk(3 * SIZE_T_SIZE); // 24바이트 확보
+    char *p = mem_sbrk(4 * SIZE_T_SIZE); // 32바이트 확보
     if (p == (void *)-1) return -1;
     
     *(size_t *)p = 0; // 패딩: 모두 0으로 채우기
-    *(size_t *)(p + SIZE_T_SIZE) = (SIZE_T_SIZE | 1); // 프롤로그 헤더 => size가 8, 할당상태
-    *(size_t *)(p + (2 * SIZE_T_SIZE)) = (0 | 1); // 에필로그 헤더 => size가 0, 할당상태
+    *(size_t *)(p + SIZE_T_SIZE) = ((2 * SIZE_T_SIZE) | 1); // 프롤로그 헤더 => size가 8, 할당상태
+    *(size_t *)(p + (2 * SIZE_T_SIZE)) = ((2 * SIZE_T_SIZE) | 1); // 프롤로그 푸터 => size: 8, 할당상태
+    *(size_t *)(p + (3 * SIZE_T_SIZE)) = (0 | 1); // 에필로그 헤더 => size가 0, 할당상태
 
-    heap_listp = p + (2 * SIZE_T_SIZE); // 힙 시작 주소 설정: 사실상 payload 주소
+    heap_listp = p + (2 * SIZE_T_SIZE); // 힙 시작 주소 설정: 사실상 payload 주소(여기선 푸터의 시작점)
     
     
     dbg_printf("\nmm_init: 모든 메모리가 초기화 됩니다. 힙 시작주소: %p (0 bytes) \n\n", heap_listp);
@@ -84,37 +88,40 @@ int mm_init(void)
 // 여기서 이해한 내용: malloc은 실제 모두 채워넣는 것이 아닌, header(명표)만 만들어 놓는다.
 void *mm_malloc(size_t size) // void와 void *는 다름 .. size_t => 메모리 크기를 표현하는 타입
 {
-    int newsize = ALIGN(size + SIZE_T_SIZE);  // header를 위한 8바이트 추가
+    int newsize = ALIGN(size + (2 * SIZE_T_SIZE));  // header를 위한 8바이트 추가
     dbg_printf("mm_malloc: 점유 공간 | 실제 메모리 양: %8d | %8d ", newsize, (int)size);
     
     void *internal_p = find_fit(newsize);
     if(internal_p != (void *)-1){
         size_t curr_size = GET_SIZE(HDRP(internal_p)); // 기존 빈 공간 사이즈
 
-        *(size_t *)HDRP(internal_p) = (newsize | 1); // header에 새 size를 할당 & 할당 명시 
-        void *next_bp = (char *)internal_p + newsize;  // 남은 공간 시작점 주소값 찾기 
-        *(size_t *)HDRP(next_bp) = ((curr_size - newsize) | 0); // 시작점 주소값에 여분 size와 할당가능 명시
+        *(size_t *)HDRP(internal_p) = (newsize | 1); // header에 새 size 할당 & 할당상태
+        *(size_t *)FTRP(internal_p) = (newsize | 1); // footer에 새 size 할당 & 할당상태
+        
+        void *next_bp = (char *)internal_p + newsize;  // 남은 공간 시작점 payload 주소값 찾기
+        int free_amount = curr_size - newsize; // 남은 공간 size 계산
+        
+        *(size_t *)HDRP(next_bp) = (free_amount | 0); // 남은 공간 header에 free_amount 명시
+        *(size_t *)FTRP(next_bp) = (free_amount | 0); // 남은 공간 footer에 free_amount 명시
         
         dbg_printf("===> find_fit 여유공간 있음! .. header 위치: %p (%ld bytes)\n", HDRP(internal_p), (char *)HDRP(internal_p) - (char *)heap_listp); 
         return(void *)internal_p; // 사용자가 할당할 payload 주소를 반환
     }
     
-    void *p = mem_sbrk(newsize) - SIZE_T_SIZE;  // p라는 변수에 "주소 숫자"를 저장함.
-                                                // payload 임으로 - 8 하여 header 생성 위치로 이동.                                             // 요 함수는 단순 영토 확장(에필로그 헤더를 넓히는) 역할을 함.
+    void *p = mem_sbrk(newsize);  // p는 mem_sbrk로 확장된 heap의 payload 주소값
     if (p == (void *)-1){
         dbg_printf("=> 공간이 부족합니다(실패)!  \n");  // 에러 결과값(-1)에 따른 방어 코드
         return NULL;
     }   
     else
     {
-        *(size_t *)p = (newsize | 1); // (구) 에필로그 자리에 header를 박는 메서드
-        *(size_t *)((char *)p + newsize) = (0 | 1); // 에필로그를 뒤로 밀어서 생성
+        *(size_t *)HDRP(p) = (newsize | 1); // (구) 에필로그 자리에 header를 박는 메서드
+        *(size_t *)FTRP(p) = (newsize | 1); // 확장된 heap의 새 footer
+        *(size_t *)(FTRP(p) + SIZE_T_SIZE) = (0 | 1); // 확장된 heap의 새 에필로그
 
-        dbg_printf("===> 공간 할당! .. header 위치: %p (%ld bytes)\n", p, (char *)p - (char *)heap_listp);
-        return (void *)((char *)p + SIZE_T_SIZE); // 다시 (char *)로 형 변환 
-                                                  // size_t(8바이트) => char(1바이트) 로 형 변환
-                                                  // 8 + 1 = 9번째 주소값을 반환: 데이터 입력이 시작되는 주소값
-                                                  // void * => 타입명 다시 변경(무엇이든 다시 가능)                                               
+        dbg_printf("===> 공간 할당! .. header 위치: %p (%ld bytes)\n", HDRP(p), HDRP(p) - (char *)heap_listp);
+        return (void *)((char *)p); // 다시 (char *)로 형으로 
+                                    // payload 값으로 반환                                           
     }
 }
 
@@ -125,7 +132,7 @@ void *mm_malloc(size_t size) // void와 void *는 다름 .. size_t => 메모리 
 // header와 footer 모두 size_t 형식의 데이터 양을 명시한다
 void mm_free(void *ptr) // ptr 주소 = payload 주소(header + 8)
 {
-    void *header = ((char *)ptr - SIZE_T_SIZE); // payload => header추출
+    void *header = HDRP(ptr); // payload => header추출
     size_t size = *(size_t *)header; // header => size_t(정수화)
     *(size_t *)header = size & ~0x1; // 마지막 비드를 0으로 만들어 해제
     
@@ -177,4 +184,14 @@ static void *find_fit(size_t put_size){
 }
 
 
-// short1-bal.rep 기본점수: Perf index = 30 (util) + 7 (thru) = 37/100 .. 37점
+
+
+// 병합 함수: mm_free & extend_heap 이벤트에서 호출
+static void *coalesce(void *bp){
+
+}
+
+
+
+// short1-bal.rep: Perf index = 30 (util) + 7 (thru) = 37/100 
+// short1-bal.rep: DEBUG x, coalesce x: Perf index = 40 (util) + 40 (thru) = 80/100
