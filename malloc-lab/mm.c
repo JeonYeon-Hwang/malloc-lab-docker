@@ -61,6 +61,7 @@ team_t team = {
 #define PREV_BLKP(bp) (((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE))) 
 
 static char *heap_listp; // heap의 시작 주소 => 1바이트 단위 계산을 위해 char로 설정
+static char *rover; // next fit 용 주소
 
 static void *find_fit(size_t put_size); // implicit 구현: 사이 탐색 함수
 static void *coalesce(void *bp); // 인접 free 공간 병합 함수
@@ -83,7 +84,7 @@ int mm_init(void)
     *(size_t *)(p + (3 * SIZE_T_SIZE)) = (0 | 1); // 에필로그 헤더 => size가 0, 할당상태
 
     heap_listp = p + (2 * SIZE_T_SIZE); // 힙 시작 주소 설정: 사실상 payload 주소(여기선 푸터의 시작점)
-    
+    rover = heap_listp; // 초기 rover는 heap 
     
     dbg_printf("\nmm_init:  heap_strt: %p (0 bytes) \n\n", heap_listp);
     return 0;
@@ -160,13 +161,23 @@ void *mm_realloc(void *ptr, size_t size)
 
 // implicit 구현: 시작부터 ==> 에필로그 헤더까지 순회
 static void *find_fit(size_t put_size){
-    void *bp; // current 포인터 역할
+    void *bp; // current 포인터 역할: payload
 
-    for(bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = (char *)bp + GET_SIZE(HDRP(bp))){ // 반복문:  
-        size_t header_value = *(size_t *)HDRP(bp); // 해당 bp의 헤더의 값을 추출
-        int is_allocated = header_value & 0x1; // 해당 헤더가 할당되어 있는지 알아보기
+    for(bp = rover; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){ // 반복문: rover => 에필로그까지
+        size_t header_val = *(size_t *)HDRP(bp); // payload로 헤더 추출
+        int is_allocated = header_val & 0x1; // 해당 블록 할당유무 확인
         if(!is_allocated && (put_size <= GET_SIZE(HDRP(bp)))){ // 할당 가능 && 사이즈 더 작을 시 포인터 반환
-            return bp; // payload로 header로 접근하려면: -8 
+            rover = bp; // rover 갱신
+            return bp; // payload 반환 
+        }
+    }
+
+    for(bp = heap_listp; bp != rover; bp = NEXT_BLKP(bp)){ // 반복문: heap_listp => rover까지
+        size_t header_val = *(size_t *)HDRP(bp); // 이하는 동일
+        int is_allocated = header_val & 0x1; 
+        if(!is_allocated && (put_size <= GET_SIZE(HDRP(bp)))){
+            rover = bp; 
+            return bp;
         }
     }
 
@@ -206,6 +217,7 @@ static void *coalesce(void *bp){
         bp = prev_bp; // bp를 앞 블록 payload로 이동
     }
     dbg_printf("병합됨         =>  header: %p(%ld bytes)   size:%d bytes\n", HDRP(bp), HDRP(bp) - (char *)heap_listp, (int)(size));
+    rover = bp;
     return bp;
 }
 
