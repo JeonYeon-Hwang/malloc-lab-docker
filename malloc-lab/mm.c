@@ -148,29 +148,58 @@ void mm_free(void *ptr) // ptr 주소 = payload 주소
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
 // 메모리 재할당 로직: 축소 and 확장 모두 가능하도록 지원해야 함.
-void *mm_realloc(void *ptr, size_t size)
+void *mm_realloc(void *ptr, size_t size) // 기본 구현
 {
-    if (ptr == NULL) return mm_malloc(size);
-    if (size == 0) {
-        mm_free(ptr);
-        return NULL;
+    if (ptr == NULL) return mm_malloc(size); // 기본 반환
+    if (size == 0) mm_free(ptr); return NULL;
+    
+    size_t before_size = GET_SIZE(HDRP(ptr)); // 해제되는 곳의 현 size
+    size_t input_size = ALIGN(size + (2 * SIZE_T_SIZE)); // 갱신되어야 할 새 size
+    char *next_bp = (char *)(ptr) + GET_SIZE((char *)(ptr) - WSIZE); // 앞 블록의 payload
+
+    if(input_size > before_size){ // 새 size가 더 큰 상황
+        if(GET_ALLOC(HDBP(next_bp)) == 0 && GET_SIZE(HDRP(next_bp)) >= (input_size - before_size)){ // 뒷 블록이 빈 & 빈 공간에 여분 채우기 가능
+            // coalesce(ptr);
+            return ptr;
+        }
+        else{
+            void *newptr = mm_malloc(size); // mm_malloc 호출하여 사용
+            if (newptr == NULL) return NULL;
+
+            size_t copySize = GET_SIZE(HDRP(ptr)) - 2 * SIZE_T_SIZE;
+            if (size < copySize) copySize = size; 
+            
+            memcpy(newptr, ptr, copySize); // 잘 모르지만 .. 그대로 데이터 복사함
+            mm_free(ptr);
+
+            return newptr;
+        }
+
     }
+    else if(input_size < before_size){ // 새 size가 더 작은 상황
+        size_t left_size = before_size - input_size;
 
-    void *newptr = mm_malloc(size); // mm_malloc 호출하여 사용
-    if (newptr == NULL) return NULL;
+        if(left_size >= (2 * DSIZE)){ // 만약 free할 여분의 공간이 충분히 있다면?
+            PUT(HDRP(ptr), PACK(input_size, 1));
+            PUT(FTRP(ptr), PACK(input_size, 1));
 
-    size_t copySize = GET_SIZE(HDRP(ptr)) - 2 * SIZE_T_SIZE;
-    if (size < copySize) copySize = size;
+            PUT(HDRP(next_bp), PACK(left_size, 0)); // 남은 여분 설정
+            PUT(HDRP(next_bp), PACK(left_size, 0));
 
-    memcpy(newptr, ptr, copySize);
-    mm_free(ptr);
-    return newptr;
+            coalesce(next_bp); // 혹시나 여분이 있는지 병합처리
+        }
+
+        return ptr;
+    }
+    else if (input_size == before_size){ // 동일한 경우
+        return ptr;
+    }  
 }
 
 
 
 
-// implicit 구현: 현 rover ==> 다음 rover까지 순회
+// explicit 구현: stack 구조 => 위에서 아래로
 static void *find_fit(size_t put_size){
     void *bp; // current 포인터 역할: payload
 
@@ -322,4 +351,4 @@ static void disconnect(void *bp){
 // short2-bal.rep 시나리오: Perf index = 60 (util) + 40 (thru) = 100/100
 
 // implicit 통합 테스트: Perf index = 46 (util) + 16 (thru) = 62/100
-// explicit 통합 테스트: Perf index = 44 (util) + 32 (thru) = 76/100
+// explicit 통합 테스트: Perf index = 44 (util) + 40 (thru) = 84/100
