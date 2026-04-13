@@ -64,6 +64,7 @@ static char *heap_listp; // heap의 시작 주소 => 1바이트 단위 계산을
 
 static void *find_fit(size_t put_size); // implicit 구현: 사이 탐색 함수
 static void *coalesce(void *bp); // 인접 free 공간 병합 함수
+static void *extend_heap(size_t new_size); // 힙을 확장하는 함수
 static void place(void *bp, size_t new_size); // 기존 free 공간에 할당/분할 함수
 
 
@@ -107,22 +108,9 @@ void *mm_malloc(size_t size) // void와 void *는 다름 .. size_t => 메모리 
         return(void *)internal_p; // 사용자가 할당할 payload 주소를 반환
     }
     
-    void *p = mem_sbrk(newsize);  // p는 mem_sbrk로 확장된 heap의 payload 주소값
-    if (p == (void *)-1){
-        dbg_printf("=> 공간이 부족합니다(실패)!  \n");  // 에러 결과값(-1)에 따른 방어 코드
-        return NULL;
-    }   
-    else
-    {
-        *(size_t *)HDRP(p) = (newsize | 1); // (구) 에필로그 자리에 header를 박는 메서드
-        *(size_t *)FTRP(p) = (newsize | 1); // 확장된 heap의 새 footer
-        *(size_t *)(FTRP(p) + SIZE_T_SIZE) = (0 | 1); // 확장된 heap의 새 에필로그
-
-        dbg_printf("  =>  힙 팽창함   header: %p (%ld bytes)\n", HDRP(p), HDRP(p) - (char *)heap_listp);
-        
-        return (void *)((char *)p); // 다시 (char *)로 형으로 
-                                    // payload 값으로 반환                                           
-    }
+    void *bp = extend_heap(newsize); // 힙 확장
+    place(bp, newsize); // 배치하고
+    return (void *)bp; // payload 반환
 }
 
 /*
@@ -223,7 +211,30 @@ static void *coalesce(void *bp){
 
 
 
-// 배치 함수
+// 힙 확장 함수
+static void *extend_heap(size_t new_size){
+    void *bp = mem_sbrk(new_size); // mem_sbrk: 힙 확장 범위를 결정 & 기존 payload 반환
+
+    if (bp == (void *)-1){ // 메모리가 초과했다면?
+        dbg_printf("=> 공간 부족!  \n");  
+        return NULL;
+    } 
+    else{
+        PUT(HDRP(bp), PACK(new_size, 0)); // 새 헤더, 비할당
+        PUT(FTRP(bp), PACK(new_size, 0)); // 새 푸터, 비할당
+        PUT(FTRP(bp) + SIZE_T_SIZE, PACK(0, 1)); // 에필로그 이사
+
+        bp = coalesce(bp);
+
+        dbg_printf("  =>  힙 팽창함   header: %p (%ld bytes)\n", HDRP(p), HDRP(p) - (char *)heap_listp);
+        return (void *)((char *)bp);
+    }
+}
+
+
+
+
+// 배치 함수: 남은 여분의 free_size를 기준으로 배치를 결정한다
 static void place(void *bp, size_t new_size){ // 받는 인자: 할당 payload & 할당할 size
     size_t free_size = GET_SIZE(HDRP(bp)); // 먼저 free_size를 구한다
     int free_amount = free_size - new_size; // 여분이 될 free_size
