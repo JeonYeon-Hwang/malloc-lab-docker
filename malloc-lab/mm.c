@@ -156,6 +156,7 @@ void mm_free(void *ptr) // ptr 주소 = payload 주소
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
 // 메모리 재할당 로직: 축소 and 확장 모두 가능하도록 지원해야 함.
+// 현재까지는 next 확장만 지원됨
 void *mm_realloc(void *ptr, size_t size) // 기본 구현
 {
     if (ptr == NULL) return mm_malloc(size); // 기본 반환
@@ -170,7 +171,6 @@ void *mm_realloc(void *ptr, size_t size) // 기본 구현
 
     if(input_size > before_size){ // 새 size가 더 큰 상황
         if(GET_ALLOC(HDRP(next_bp)) == 0 && before_size + GET_SIZE(HDRP(next_bp)) >= input_size ){ // 뒷 블록이 빈 & 빈 공간에 여분 채우기 가능
-            // disconnect(next_bp); // 인접 free 블럭을 연결리스트에서 삭제
             delete_node(next_bp);
             
             size_t merge_size = before_size + GET_SIZE(HDRP(next_bp)); // 합칠 경우 총 size
@@ -185,7 +185,6 @@ void *mm_realloc(void *ptr, size_t size) // 기본 구현
                 PUT(HDRP(remain_bp), PACK(extra_size, 0)); 
                 PUT(FTRP(remain_bp), PACK(extra_size, 0));
 
-                // new_connect(remain_bp);
                 insert_node(remain_bp, extra_size);
             }
             else{
@@ -195,19 +194,29 @@ void *mm_realloc(void *ptr, size_t size) // 기본 구현
 
             return ptr;
         }
-        else{
-            void *newptr = mm_malloc(size); // mm_malloc 호출하여 사용
-            if (newptr == NULL) return NULL;
+        if(GET_SIZE(HDRP(next_bp)) == 0){ // 현재 힙의 끝단이라면?
+            size_t extra_size = input_size - before_size; // 확장할 여분을 구하고
 
-            size_t copySize = GET_SIZE(HDRP(ptr)) - 2 * SIZE_T_SIZE;
-            if (size < copySize) copySize = size; 
-            
-            memcpy(newptr, ptr, copySize); // 잘 모르지만 .. 그대로 데이터 복사함
-            mm_free(ptr);
+            if(mem_sbrk(extra_size) == (void *)-1) return NULL;
 
-            return newptr;
+            PUT(HDRP(ptr), PACK(input_size, 1)); // 확장된 헤더 푸터 설정
+            PUT(FTRP(ptr), PACK(input_size, 1));
+
+            PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1)); // 에필로그 헤더 배치
+
+            return ptr;
         }
+        
+        void *newptr = mm_malloc(size); // mm_malloc 호출하여 사용
+        if (newptr == NULL) return NULL;
 
+        size_t copySize = GET_SIZE(HDRP(ptr)) - 2 * SIZE_T_SIZE;
+        if (size < copySize) copySize = size; 
+        
+        memcpy(newptr, ptr, copySize); // 잘 모르지만 .. 그대로 데이터 복사함
+        mm_free(ptr);
+
+        return newptr;
     }
     else if(input_size < before_size){ // 새 size가 더 작은 상황
         size_t left_size = before_size - input_size;
@@ -440,3 +449,4 @@ static void delete_node(void *bp){
 
 // realloc 수정 후: Perf index = 45 (util) + 40 (thru) = 85/100
 // seglist 통합 테스트: Perf index = 47 (util) + 40 (thru) = 87/100
+// realloc 힙 말단 확장: Perf index = 52 (util) + 40 (thru) = 92/100
