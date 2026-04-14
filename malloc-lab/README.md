@@ -28,16 +28,16 @@ Makefile
 Other support files for the driver
 **********************************
 
-// 기본 설정 규칙
+기본 설정 규칙
 config.h	Configures the malloc lab driver
 
-// 요 아래 4개는 시간 측정기
+요 아래 4개는 시간 측정기
 fsecs.{c,h}	Wrapper function for the different timer packages
 clock.{c,h}	Routines for accessing the Pentium and Alpha cycle counters
 fcyc.{c,h}	Timer functions based on cycle counters
 ftimer.{c,h}	Timer functions based on interval timers and gettimeofday()
 
-// 가상 힙 메모리 공간 => 실제 그 만큼 메모리를 확보하여 할당&해제를 진행함
+가상 힙 메모리 공간 => 실제 그 만큼 메모리를 확보하여 할당&해제를 진행함
 memlib.{c,h}	Models the heap and sbrk function
 
 *******************************
