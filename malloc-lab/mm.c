@@ -151,15 +151,37 @@ void mm_free(void *ptr) // ptr 주소 = payload 주소
 void *mm_realloc(void *ptr, size_t size) // 기본 구현
 {
     if (ptr == NULL) return mm_malloc(size); // 기본 반환
-    if (size == 0) mm_free(ptr); return NULL;
+    if (size == 0){
+        mm_free(ptr); 
+        return NULL;
+    } 
     
     size_t before_size = GET_SIZE(HDRP(ptr)); // 해제되는 곳의 현 size
     size_t input_size = ALIGN(size + (2 * SIZE_T_SIZE)); // 갱신되어야 할 새 size
-    char *next_bp = (char *)(ptr) + GET_SIZE((char *)(ptr) - WSIZE); // 앞 블록의 payload
+    char *next_bp = NEXT_BLKP(ptr); // 다음 블록의 payload
 
     if(input_size > before_size){ // 새 size가 더 큰 상황
-        if(GET_ALLOC(HDBP(next_bp)) == 0 && GET_SIZE(HDRP(next_bp)) >= (input_size - before_size)){ // 뒷 블록이 빈 & 빈 공간에 여분 채우기 가능
-            // coalesce(ptr);
+        if(GET_ALLOC(HDRP(next_bp)) == 0 && before_size + GET_SIZE(HDRP(next_bp)) >= input_size ){ // 뒷 블록이 빈 & 빈 공간에 여분 채우기 가능
+            disconnect(next_bp); // 인접 free 블럭을 연결리스트에서 삭제
+            size_t merge_size = before_size + GET_SIZE(HDRP(next_bp)); // 합칠 경우 총 size
+            size_t extra_size = merge_size - input_size;
+
+            if(extra_size >= (2 * DSIZE)){
+                PUT(HDRP(ptr), PACK(input_size, 1));
+                PUT(FTRP(ptr), PACK(input_size, 1));
+
+                void *remain_bp = (char *)ptr + input_size; // 여분 size의 시작 payload
+                
+                PUT(HDRP(remain_bp), PACK(extra_size, 0)); 
+                PUT(FTRP(remain_bp), PACK(extra_size, 0));
+
+                new_connect(remain_bp);
+            }
+            else{
+                PUT(HDRP(ptr), PACK(merge_size, 1));
+                PUT(FTRP(ptr), PACK(merge_size, 1));
+            }
+
             return ptr;
         }
         else{
@@ -183,15 +205,17 @@ void *mm_realloc(void *ptr, size_t size) // 기본 구현
             PUT(HDRP(ptr), PACK(input_size, 1));
             PUT(FTRP(ptr), PACK(input_size, 1));
 
-            PUT(HDRP(next_bp), PACK(left_size, 0)); // 남은 여분 설정
-            PUT(HDRP(next_bp), PACK(left_size, 0));
+            void *remain_bp = (char *)ptr + input_size;
 
-            coalesce(next_bp); // 혹시나 여분이 있는지 병합처리
+            PUT(HDRP(remain_bp), PACK(left_size, 0)); // 남은 여분 설정
+            PUT(FTRP(remain_bp), PACK(left_size, 0));
+
+            coalesce(remain_bp); // 혹시나 여분이 있는지 병합처리
         }
 
         return ptr;
     }
-    else if (input_size == before_size){ // 동일한 경우
+    else{ // 동일한 경우
         return ptr;
     }  
 }
@@ -352,3 +376,5 @@ static void disconnect(void *bp){
 
 // implicit 통합 테스트: Perf index = 46 (util) + 16 (thru) = 62/100
 // explicit 통합 테스트: Perf index = 44 (util) + 40 (thru) = 84/100
+
+// realloc 수정 후: Perf index = 45 (util) + 40 (thru) = 85/100
