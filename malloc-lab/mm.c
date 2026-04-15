@@ -50,13 +50,14 @@ team_t team = {
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 #define GET_SIZE(p) (*(size_t *)(p) & ~0x7) // 해당 주소의 8바이트 값 읽어서 size 도출
 #define GET_ALLOC(p) (*(size_t *)(p) & 0x1) // 해당 주소의 1바이트 값 읽어서 할당유무 확인
+#define GET_PREV_ALLOC(p) (*(size_t *)(p) & 0x2) // 해당 주소의 2바이트 값 읽어서 할당유무 확인
 #define HDRP(bp) ((char *)bp - SIZE_T_SIZE) // payload 주소값으로 header 찾기
 #define FTRP(bp) ((char *)bp + GET_SIZE(HDRP(bp)) - (2 * SIZE_T_SIZE)) // payload 주소값으로 footer 찾기
 
 // 얘들은 일단 복붙
 #define WSIZE (SIZE_T_SIZE)
 #define DSIZE (2 * SIZE_T_SIZE)
-#define PACK(size, alloc) ((size) | (alloc))
+#define PACK(size, prev_alloc, alloc) ((size)|(prev_alloc)|(alloc))
 #define PUT(p, val) (*(size_t *)(p) = (val))
 #define NEXT_BLKP(bp) (((char *)(bp) + GET_SIZE((char *)(bp) - WSIZE)))
 #define PREV_BLKP(bp) (((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE))) 
@@ -84,7 +85,7 @@ static void delete_node(void *bp); // 노드 삭제하기
 // 메모리를 초기화 하는 로직: 한 테스트 시나리오 종료 시 발동
 int mm_init(void)
 {
-    char *p = mem_sbrk(6 * WSIZE); // 48바이트 확보
+    char *p = mem_sbrk(5 * WSIZE); // 48바이트 확보
     if (p == (void *)-1) return -1;
 
     int list;
@@ -96,12 +97,10 @@ int mm_init(void)
     
     *(size_t *)p = 0; // 패딩: 모두 0으로 채우기
     
-    *(size_t *)(p + WSIZE) = ((2 * DSIZE) | 1); // 프롤로그 헤더 => size가 8, 할당상태
+    *(size_t *)(p + WSIZE) = PACK((3 * WSIZE) , 2 , 1); // 프롤로그 헤더
     *(void **)(p + (2 * WSIZE)) = NULL; // 프롤로그 prev 포인터 => NULL 상태
-    *(void **)(p + (3 * WSIZE)) = NULL; // 프롤로그 next 포인터 => NULL 상태
-    *(size_t *)(p + (4 * WSIZE)) = ((2 * DSIZE) | 1); // 프롤로그 푸터 => size: 8, 할당상태
-    
-    *(size_t *)(p + (5 * WSIZE)) = (0 | 1); // 에필로그 헤더 => size가 0, 할당상태
+    *(void **)(p + (3 * WSIZE)) = NULL; // 프롤로그 next 포인터 => NULL 상태 
+    *(size_t *)(p + (4 * WSIZE)) = PACK(0 , 2 , 1); // 에필로그 헤더 
 
     heap_listp = p + (2 * WSIZE); // 힙 시작 주소 설정: 현 payload 주소
     top_free = p + (2 * WSIZE); // 바로 이전에 해제한 메모리 주소: 현 payload 주소
@@ -118,7 +117,9 @@ int mm_init(void)
 // 메모리를 할당하는 로직: 현재 기본적인 것만 구현되어 있음
 void *mm_malloc(size_t size) // void와 void *는 다름 .. size_t => 메모리 크기를 표현하는 타입
 {
-    int newsize = ALIGN(size + (2 * SIZE_T_SIZE));  //
+    int newsize = ALIGN(size + SIZE_T_SIZE);  
+    if (newsize < (2 * DSIZE)) newsize = (2 * DSIZE); // 최소 사이즈 만족해야 함
+    
     dbg_printf("mm_malloc 실행 => %8d %8d", newsize, (int)size);
     
     void *internal_p = find_fit(newsize);
@@ -130,6 +131,7 @@ void *mm_malloc(size_t size) // void와 void *는 다름 .. size_t => 메모리 
     }
     
     void *bp = extend_heap(newsize); // 힙 확장
+    if (bp == NULL) return NULL;
     place(bp, newsize); // 배치하고
     return (void *)bp; // payload 반환
 }
@@ -144,9 +146,13 @@ void mm_free(void *ptr) // ptr 주소 = payload 주소
     if(ptr == NULL) return;
 
     size_t size = GET_SIZE(HDRP(ptr)); // payload 기반 size 추출
-    PUT(HDRP(ptr), PACK(size, 0)); //payload 기반 헤더 할당해제
-    PUT(FTRP(ptr), PACK(size, 0)); //payload 기반 푸터 할당해제
+    size_t prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
+    PUT(HDRP(ptr), PACK(size, prev_alloc, 0)); //payload 기반 헤더 할당해제
+    PUT(FTRP(ptr), PACK(size, prev_alloc, 0)); //payload 기반 푸터 할당해제
     
+    size_t *next_ptr = (size_t *)HDRP(NEXT_BLKP(ptr));
+    *next_ptr &= ~0x2; // 다음 블록의 헤더 0x2는 0
+
     dbg_printf("매모리 해제    =>  header: %8p   size: %d bytes\n", HDRP(ptr), (int)(size));
     
     coalesce(ptr); // 병합하기
@@ -166,30 +172,38 @@ void *mm_realloc(void *ptr, size_t size) // 기본 구현
     } 
     
     size_t before_size = GET_SIZE(HDRP(ptr)); // 해제되는 곳의 현 size
-    size_t input_size = ALIGN(size + (2 * SIZE_T_SIZE)); // 갱신되어야 할 새 size
+    size_t prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
+    size_t input_size = ALIGN(size + WSIZE); // 갱신되어야 할 새 size
+    
+    if (input_size< (2 * DSIZE)) input_size = (2 * DSIZE);
+
     char *next_bp = NEXT_BLKP(ptr); // 다음 블록의 payload
 
     if(input_size > before_size){ // 새 size가 더 큰 상황
-        if(GET_ALLOC(HDRP(next_bp)) == 0 && before_size + GET_SIZE(HDRP(next_bp)) >= input_size ){ // 뒷 블록이 빈 & 빈 공간에 여분 채우기 가능
+        if(GET_ALLOC(HDRP(next_bp)) == 0 && before_size + GET_SIZE(HDRP(next_bp)) >= input_size ){ // 빈 공간에 여분 채우기 가능
             delete_node(next_bp);
             
             size_t merge_size = before_size + GET_SIZE(HDRP(next_bp)); // 합칠 경우 총 size
             size_t extra_size = merge_size - input_size;
 
             if(extra_size >= (2 * DSIZE)){
-                PUT(HDRP(ptr), PACK(input_size, 1));
-                PUT(FTRP(ptr), PACK(input_size, 1));
+                PUT(HDRP(ptr), PACK(input_size, prev_alloc, 1));
 
                 void *remain_bp = (char *)ptr + input_size; // 여분 size의 시작 payload
                 
-                PUT(HDRP(remain_bp), PACK(extra_size, 0)); 
-                PUT(FTRP(remain_bp), PACK(extra_size, 0));
+                PUT(HDRP(remain_bp), PACK(extra_size, 2, 0)); 
+                PUT(FTRP(remain_bp), PACK(extra_size, 2, 0));
+
+                size_t *next_hdr = (size_t *)HDRP(NEXT_BLKP(remain_bp));
+                *next_hdr &= ~0x2; // remain 뒷집에 free임 수정
 
                 insert_node(remain_bp, extra_size);
             }
             else{
-                PUT(HDRP(ptr), PACK(merge_size, 1));
-                PUT(FTRP(ptr), PACK(merge_size, 1));
+                PUT(HDRP(ptr), PACK(merge_size, prev_alloc, 1));
+
+                size_t *next_hdr = (size_t *)HDRP(NEXT_BLKP(ptr));
+                *next_hdr |= 0x2; // 뒷집에 fill임 수정
             }
 
             return ptr;
@@ -199,18 +213,16 @@ void *mm_realloc(void *ptr, size_t size) // 기본 구현
 
             if(mem_sbrk(extra_size) == (void *)-1) return NULL;
 
-            PUT(HDRP(ptr), PACK(input_size, 1)); // 확장된 헤더 푸터 설정
-            PUT(FTRP(ptr), PACK(input_size, 1));
-
-            PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1)); // 에필로그 헤더 배치
-
+            PUT(HDRP(ptr), PACK(input_size, prev_alloc, 1)); // 확장된 헤더 설정
+            PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 2, 1)); // 에필로그 헤더 배치
+            
             return ptr;
         }
         
         void *newptr = mm_malloc(size); // mm_malloc 호출하여 사용
         if (newptr == NULL) return NULL;
 
-        size_t copySize = GET_SIZE(HDRP(ptr)) - 2 * SIZE_T_SIZE;
+        size_t copySize = GET_SIZE(HDRP(ptr)) - WSIZE;
         if (size < copySize) copySize = size; 
         
         memcpy(newptr, ptr, copySize); // 잘 모르지만 .. 그대로 데이터 복사함
@@ -222,13 +234,12 @@ void *mm_realloc(void *ptr, size_t size) // 기본 구현
         size_t left_size = before_size - input_size;
 
         if(left_size >= (2 * DSIZE)){ // 만약 free할 여분의 공간이 충분히 있다면?
-            PUT(HDRP(ptr), PACK(input_size, 1));
-            PUT(FTRP(ptr), PACK(input_size, 1));
+            PUT(HDRP(ptr), PACK(input_size, prev_alloc, 1));
 
             void *remain_bp = (char *)ptr + input_size;
 
-            PUT(HDRP(remain_bp), PACK(left_size, 0)); // 남은 여분 설정
-            PUT(FTRP(remain_bp), PACK(left_size, 0));
+            PUT(HDRP(remain_bp), PACK(left_size, 2, 0)); // 남은 여분 설정
+            PUT(FTRP(remain_bp), PACK(left_size, 2, 0));
 
             coalesce(remain_bp); // 혹시나 여분이 있는지 병합처리
         }
@@ -254,15 +265,14 @@ static void *find_fit(size_t put_size){
         list++;
     }
 
+    
     for(; list < LISTLIMIT; list++){ // 찾지 못했을 경우, 다음 index로 넘어감
         void *search_bp = segregation_list[list];
 
-        while(search_bp != NULL){
+        for(; search_bp != NULL; search_bp =  *(void **)((char *)search_bp + WSIZE)){
             if(GET_SIZE(HDRP(search_bp)) >= block_size){
                 return search_bp;
             }
-
-            search_bp = *(void **)((char *)search_bp + WSIZE);
         }
     }
     
@@ -273,56 +283,51 @@ static void *find_fit(size_t put_size){
 
 
 // 병합 함수: mm_free & extend_heap 이벤트에서 호출 => 4가지 경우의 수
-static void *coalesce(void *bp){ 
-    char *prev_bp = (char *)bp - GET_SIZE((char *)(bp) - (2 * SIZE_T_SIZE)); // 이전 블록의 payload
+static void *coalesce(void *bp){ // 현 블록 payload
     char *next_bp = (char *)bp + GET_SIZE((char *)(bp) - (SIZE_T_SIZE)); // 다음 블록의 payload
 
-    size_t prev_alloc = GET_ALLOC(FTRP(prev_bp)); // 현 payload 기준 => 푸터로 이동하여 할당유무 확인
+    size_t prev_alloc = GET_PREV_ALLOC(HDRP(bp)); // 현 payload 기준 => 푸터로 이동하여 할당유무 확인
     size_t next_alloc = GET_ALLOC(HDRP(next_bp)); // 현 payload 기준 => 헤더로 이동하여 할당유무 확인
     size_t size = GET_SIZE(HDRP(bp)); // 현 payload 기준 => 블록의 size 추출
 
     if(prev_alloc && next_alloc){ // 앞 뒤 블록이 모두 할당되어 있다면?
-        // new_connect(bp); // 스택에 free블록 하나 쌓기
-        insert_node(bp, size);
-        return bp; // 변화 없음
+        
     }
     else if(prev_alloc && !next_alloc){ // 뒤 블록만 free라면?
         delete_node(next_bp);
 
         size += GET_SIZE(HDRP(next_bp)); // 뒤 블록의 size를 더함
-        *(size_t *)HDRP(bp) = (size | 0); // 현 블록 헤더 size 확장 
-        *(size_t *)FTRP(bp) = (size | 0); // 현 블록 푸터 size 확장 
-
-        // disconnect(next_bp); // 뒤 free 없애기
-        // new_connect(bp); // 합쳐진 free블록을 쌓기
-        insert_node(bp, size);
+        *(size_t *)HDRP(bp) = PACK(size, 2, 0); // 현 블록 헤더 size 확장 
+        *(size_t *)FTRP(bp) = PACK(size, 2, 0); // 현 블록 푸터 size 확장 
     }
     else if(!prev_alloc && next_alloc){ // 앞 블록만 free라면?
+        void *prev_bp = (char *)bp - GET_SIZE((char *)bp - DSIZE);
         delete_node(prev_bp);
         
         size += GET_SIZE(HDRP(prev_bp)); // 앞 블록의 size를 더함
-        *(size_t *)HDRP(prev_bp) = (size | 0); // 앞 블록 헤더 size 확장
-        *(size_t *)FTRP(prev_bp) = (size | 0); // 현 블록 푸터 size 확장
+        size_t prev_prev_alloc = GET_PREV_ALLOC(HDRP(prev_bp));
+        *(size_t *)HDRP(prev_bp) = PACK(size, prev_prev_alloc, 0); // 앞 블록 헤더 size 확장
+        *(size_t *)FTRP(prev_bp) = PACK(size, prev_prev_alloc, 0); // 현 블록 푸터 size 확장
         
-        // disconnect(prev_bp); // 앞 free블록을 일단 없앰
         bp = prev_bp; // bp를 앞 블록 payload로 이동
-        // new_connect(bp); // 합쳐진 free블록으로 쌓기
-        insert_node(bp, size);
     }
     else if(!prev_alloc && !next_alloc){ // 앞 뒤 블록 모두 free라면?
+        void *prev_bp = (char *)bp - GET_SIZE((char *)bp - DSIZE);
         delete_node(prev_bp);
         delete_node(next_bp);
         
         size += (GET_SIZE(HDRP(next_bp)) + GET_SIZE(HDRP(prev_bp))); // 앞 뒤 블록의 size를 모두 더함
-        *(size_t *)HDRP(prev_bp) = (size | 0); // 앞 블록의 헤더 size 확장
-        *(size_t *)FTRP(prev_bp) = (size | 0); // 뒤 블록의 푸터 size 확장
+        size_t prev_prev_alloc = GET_PREV_ALLOC(HDRP(prev_bp));
+        *(size_t *)HDRP(prev_bp) = PACK(size, prev_prev_alloc, 0);// 앞 블록의 헤더 size 확장
+        *(size_t *)FTRP(prev_bp) = PACK(size, prev_prev_alloc, 0); // 뒤 블록의 푸터 size 확장
         
-        // disconnect(prev_bp); // 앞 free 없애기
-        // disconnect(next_bp); // 뒤 free 없애기
         bp = prev_bp; // bp를 앞 블록 payload로 이동
-        // new_connect(bp); // 앞뒤로 합쳐진 큰 free블록을 쌓기
-        insert_node(bp, size);
     }
+
+    size_t *next_hdr = (size_t *)HDRP(NEXT_BLKP(bp));
+    *next_hdr &= ~0x2;
+
+    insert_node(bp, size);
     dbg_printf("병합됨         =>  header: %p(%ld bytes)   size:%d bytes\n", HDRP(bp), HDRP(bp) - (char *)heap_listp, (int)(size));
     // rover = bp;
     return bp;
@@ -339,9 +344,10 @@ static void *extend_heap(size_t new_size){
         return NULL;
     } 
     else{
-        PUT(HDRP(bp), PACK(new_size, 0)); // 새 헤더, 비할당
-        PUT(FTRP(bp), PACK(new_size, 0)); // 새 푸터, 비할당
-        PUT(FTRP(bp) + SIZE_T_SIZE, PACK(0, 1)); // 에필로그 이사
+        size_t prev_alloc = GET_PREV_ALLOC(HDRP(bp));
+        PUT(HDRP(bp), PACK(new_size, prev_alloc, 0)); // 새 헤더, 비할당
+        PUT(FTRP(bp), PACK(new_size, prev_alloc, 0)); // 새 푸터, 비할당
+        PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 0, 1)); // 에필로그 이사
 
         bp = coalesce(bp);
 
@@ -356,26 +362,29 @@ static void *extend_heap(size_t new_size){
 // 배치 함수: 남은 여분의 free_size를 기준으로 배치를 결정한다
 static void place(void *bp, size_t new_size){ // 받는 인자: 할당 payload & 할당할 size
     size_t free_size = GET_SIZE(HDRP(bp)); // 먼저 free_size를 구한다
+    size_t prev_alloc = GET_PREV_ALLOC(HDRP(bp));
     int free_amount = free_size - new_size; // 여분이 될 free_size
 
     // disconnect(bp); // free 스택에서 연결 해제
     delete_node(bp);
 
     if(free_amount >= (2 * DSIZE)){ // 여분의 공간이 32바이트 이상이라면?
-        PUT(HDRP(bp), PACK(new_size, 1)); // 헤더 new_size로 갱신
-        PUT(FTRP(bp), PACK(new_size, 1)); // 푸터 new_size로 갱신
+        PUT(HDRP(bp), PACK(new_size, prev_alloc, 1)); // 헤더 new_size로 갱신
 
         void *next_bp = (char *)bp + new_size; // 여분이 될 free_size의 payload
 
-        PUT(HDRP(next_bp), PACK(free_amount, 0)); // 여분 헤더 생성
-        PUT(FTRP(next_bp), PACK(free_amount, 0)); // 여분 푸터 생성
-        
-        // new_connect(next_bp); // 일단 새로 생긴 free이니..
+        PUT(HDRP(next_bp), PACK(free_amount, 2, 0)); // 여분 헤더 생성
+        PUT(FTRP(next_bp), PACK(free_amount, 2, 0)); // 여분 푸터 생성
+
+        size_t *next_hdr = (size_t *)HDRP(NEXT_BLKP(next_bp));
+        *next_hdr &= ~0x2;
+
         insert_node(next_bp, free_amount);
     }
     else{ // 여분의 공간이 16 바이트 미만이라면? => 내부 단편화 감수
-        PUT(HDRP(bp), PACK(free_size, 1));
-        PUT(FTRP(bp), PACK(free_size, 1));
+        PUT(HDRP(bp), PACK(free_size, prev_alloc, 1));
+        size_t *next_bp = (size_t *)HDRP(NEXT_BLKP(bp)); // 다음 블록에 할당유무 입력
+        *next_bp |= 0x2; // 다음 블록에: 우리 할당 되었어요~
     }
 }
 
@@ -447,6 +456,6 @@ static void delete_node(void *bp){
 // implicit 통합 테스트: Perf index = 46 (util) + 16 (thru) = 62/100
 // explicit 통합 테스트: Perf index = 44 (util) + 40 (thru) = 84/100
 
-// realloc 수정 후: Perf index = 45 (util) + 40 (thru) = 85/100
+// realloc next 확장: Perf index = 45 (util) + 40 (thru) = 85/100
 // seglist 통합 테스트: Perf index = 47 (util) + 40 (thru) = 87/100
 // realloc 힙 말단 확장: Perf index = 52 (util) + 40 (thru) = 92/100
